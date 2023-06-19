@@ -1,0 +1,169 @@
+import argparse
+import fnmatch
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import pickle
+import time
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import numpy as np
+import cv2
+import torch
+from torch.utils.model_zoo import load_url
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+import torchvision
+import torch.nn as nn
+import csv
+
+from solar_global.networks.imageretrievalnet import init_network, extract_vectors
+from solar_global.datasets.testdataset import configdataset
+from solar_global.utils.download import download_test
+from solar_global.utils.evaluate import compute_map_and_print
+from solar_global.utils.general import get_data_root, htime
+from solar_global.utils.networks import load_network
+from solar_global.utils.plots import plot_ranks, plot_embeddings
+
+# some conflicts between tensorflow and tensoboard 
+# causing embeddings to not be saved properly in tb
+try:
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    import tensorflow as tf
+    import tensorboard as tb
+    tf.io.gfile = tb.compat.tensorflow_stub.io.gfile
+except:
+    pass
+
+_MEAN = [0.485, 0.456, 0.406]
+_SD = [0.229, 0.224, 0.225]
+_scale_list = [0.7071, 1.0, 1.4142]
+# _scale_list = [2.0, 1.414, 1.0, 0.707, 0.5]
+# _scale_list = [1.2, 1.3, 1.4142]
+
+def color_norm(im, mean, std):
+    """Performs per-channel normalization (CHW format)."""
+    for i in range(im.shape[0]):
+        im[i] = im[i] - mean[i]
+        im[i] = im[i] / std[i]
+    return im
+
+trans = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+        ])
+def prepare_im( im):
+        """Prepares the image for network input."""
+        im = im.transpose([2, 0, 1])
+        # [0, 255] -> [0, 1]
+        im = im / 255.0
+        # Color normalization
+        im = color_norm(im, _MEAN, _SD)
+        # im = trans(im)
+        im = torch.from_numpy(im).cuda()
+        im = im.unsqueeze(0)
+        return im
+
+def extract_feat(net, img_path):
+    img_ = cv2.imread(img_path)
+    img_query = cv2.cvtColor(img_, cv2.COLOR_BGR2RGB)
+    im = img_query
+    # im = np.stack((im,)*3, axis=-1)   
+    center = im.shape
+    im = cv2.resize(im, (320, int(center[0]*320/center[1])))
+    # im = cv2.resize(im, (512,512))
+    center = im.shape
+    w =  center[1] * 0.9
+    h =  center[0] * 0.9
+    x = center[1]/2 - w/2
+    y = center[0]/2 - h/2
+    # im = im[int(y):int(y+h), int(x):int(x+w)]
+    im = im.astype(np.float32, copy=False)
+    im = prepare_im(im)
+
+    v = torch.zeros(net.meta['outputdim'])
+    
+    for s in _scale_list:
+        if s == 1:
+            _input_t = im.clone()
+        else:
+            _input_t = nn.functional.interpolate(im, scale_factor=s, mode='bilinear', align_corners=False)
+        v += net(_input_t).pow(1).cpu().data.squeeze()
+    v /= len(_scale_list)
+    v = v.pow(1./1)
+    v /= v.norm()
+    return v
+
+if __name__ == '__main__':
+    net = load_network(network_name='resnet101-solar-best.pth')
+    net.cuda()
+    net.eval()
+    print(net.meta_repr())
+    
+    # img_path = "/media/anlab/0e731fe3-5959-4d40-8958-e9f6296b38cb/home/anlab/songuyen/SOLAR/data/test/roxford5k/jpg/trinity_000015.jpg"
+
+    # feat_query = extract_feat(net, img_path)
+    # print(feat_query)
+
+    folder_test = "/media/anlab/0e731fe3-5959-4d40-8958-e9f6296b38cb/home/anlab/songuyen/data_pill_1912/data_1111_crop_2step/test_logo/"
+    folder_train = "/media/anlab/0e731fe3-5959-4d40-8958-e9f6296b38cb/home/anlab/songuyen/data_pill_1912/data_1111_crop_2step/train/"
+
+    path_list = []
+    X = []
+
+    with open('/media/anlab/0e731fe3-5959-4d40-8958-e9f6296b38cb/home/anlab/songuyen/data_pill_1912/data_1111_crop_2step/train/paths.txt','r') as f:
+        IMAGE_PATH_DB = [line.strip('\n') for line in f.readlines()]
+    print("creat_DB:==============", len(IMAGE_PATH_DB))
+    for i in range(len(IMAGE_PATH_DB)):
+        print(i, IMAGE_PATH_DB[i])
+        start = time.time()
+        path_list.append(IMAGE_PATH_DB[i])
+        key_path = folder_train + IMAGE_PATH_DB[i]
+        x= extract_feat(net, key_path)
+        x = x.numpy()
+        X.append(x)
+        print(time.time() - start)
+    print("finish_extract_DB=====")
+
+    with open('/media/anlab/0e731fe3-5959-4d40-8958-e9f6296b38cb/home/anlab/songuyen/data_pill_1912/data_1111_crop_2step/test_logo/paths.txt','r') as read:
+        reader = csv.reader(read)
+        list_correct = []
+        n = 0
+        for row in reader:
+            time0 = time.time()
+            q = row[0]
+            print(q)
+            matchs = []
+            dists_list = []
+            # dict_data[q] = matchs
+            query_path = folder_test + q
+            feat_q = extract_feat(net, query_path)
+            feat_q = feat_q.numpy()
+
+            for r in row[1:]:
+                matchs.append(r)
+            score_list = []
+            for i in range(len(X)):
+                sco = np.dot(X[i], feat_q.T)
+                score = np.array(sco)
+                score_list.append(score)
+
+            # sim = np.dot(X, Q.T)
+            # ranks = np.argsort(-sim, axis=0)
+
+            dict_list_score = dict(zip(path_list, score_list))
+            dict_list_score_sort = sorted(dict_list_score.items(), key=lambda x:-x[1])[:30]
+            print("time:", time.time() - time0)
+            # print(dict_list_score_sort)
+            path_list_sort = []
+            list_score_sort =[]
+            for i in range(len(dict_list_score_sort)):
+                path_list_sort.append(dict_list_score_sort[i][0])
+                list_score_sort.append(dict_list_score_sort[i][1])
+
+            _str = '|'.join([str(elem) for elem in path_list_sort])
+            _sc = '|'.join([str(elem) for elem in list_score_sort])
+            APP_CODE = 'SOLAR_global'
+            rst = f"{n},{APP_CODE},{q}, {_str}, {_sc}"
+            n += 1
+            with open('PILL_searching_solar_2212v1_sz512.csv', 'a') as f:
+                f.write(f'{rst}\n')
